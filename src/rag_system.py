@@ -1,4 +1,5 @@
 import os
+import json
 from typing import List, Dict
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -18,7 +19,11 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 RAW_DIR = os.path.join(DATA_DIR, "raw")
 PROCESSED_DIR = os.path.join(DATA_DIR, "processed")
-URLS_FILE = os.path.join(PROCESSED_DIR, "urls.txt")
+EMBEDDINGS_DIR = os.path.join(DATA_DIR, "embeddings")
+EMBEDDINGS_FILE = os.path.join(EMBEDDINGS_DIR, "embeddings.json")
+
+# Crear directorio de embeddings si no existe
+os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
 
 class WebRAGSystem:
     def __init__(self):
@@ -47,21 +52,44 @@ class WebRAGSystem:
         # Inicializar ChromaDB
         self.chroma_client = chromadb.Client()
         self.collection = self.chroma_client.create_collection(name="web_content")
-        # Colección para caché de preguntas y respuestas
         self.cache_collection = self.chroma_client.create_collection(name="query_cache")
-        # Colección para almacenar contexto recuperado
         self.context_collection = self.chroma_client.create_collection(name="retrieved_context")
         
         # Inicializar el splitter de texto
         self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,
-            chunk_overlap=50
+            chunk_size=300,
+            chunk_overlap=30
         )
         
         # Cola para resultados procesados
         self.results_queue = Queue()
         
+        # Cargar embeddings existentes
+        self.load_embeddings()
+        
         print("Sistema inicializado correctamente.")
+
+    def load_embeddings(self):
+        """Carga los embeddings desde el archivo JSON."""
+        try:
+            if os.path.exists(EMBEDDINGS_FILE):
+                with open(EMBEDDINGS_FILE, 'r', encoding='utf-8') as f:
+                    embeddings_data = json.load(f)
+                    print(f"Embeddings cargados: {len(embeddings_data)} documentos")
+                    return embeddings_data
+            return {}
+        except Exception as e:
+            print(f"Error al cargar embeddings: {str(e)}")
+            return {}
+
+    def save_embeddings(self, embeddings_data: Dict):
+        """Guarda los embeddings en el archivo JSON."""
+        try:
+            with open(EMBEDDINGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(embeddings_data, f, ensure_ascii=False, indent=2)
+            print(f"Embeddings guardados: {len(embeddings_data)} documentos")
+        except Exception as e:
+            print(f"Error al guardar embeddings: {str(e)}")
 
     def extract_web_content(self, file_path: str) -> str:
         """Extrae el contenido de un archivo HTML local."""
@@ -119,10 +147,25 @@ class WebRAGSystem:
         """Procesa y almacena el contenido de los archivos en paralelo."""
         print("\nIniciando procesamiento paralelo...")
         
+        # Cargar embeddings existentes
+        embeddings_data = self.load_embeddings()
+        
+        # Verificar qué archivos ya están procesados
+        existing_sources = set(embeddings_data.keys())
+        
+        # Filtrar archivos que necesitan ser procesados
+        files_to_process = [f for f in files if os.path.basename(f) not in existing_sources]
+        
+        if not files_to_process:
+            print("Todos los archivos ya están procesados.")
+            return
+            
+        print(f"Procesando {len(files_to_process)} archivos nuevos...")
+        
         # Procesar archivos en paralelo
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.worker_models)) as executor:
             futures = []
-            for i, file in enumerate(files):
+            for i, file in enumerate(files_to_process):
                 model_index = i % len(self.worker_models)
                 futures.append(executor.submit(self.process_file_parallel, file, model_index))
             
@@ -132,28 +175,47 @@ class WebRAGSystem:
         # Procesar resultados de la cola
         while not self.results_queue.empty():
             file_path, processed_content = self.results_queue.get()
+            file_name = os.path.basename(file_path)
             
             # Dividir el contenido procesado en chunks
-            print(f"\nDividiendo contenido de {os.path.basename(file_path)} en chunks...")
+            print(f"\nDividiendo contenido de {file_name} en chunks...")
             chunks = self.text_splitter.split_text(processed_content)
             print(f"Generados {len(chunks)} chunks")
             
-            # Generar embeddings y almacenar en ChromaDB
-            print("Generando embeddings y almacenando en ChromaDB...")
+            # Generar embeddings y almacenar
+            print("Generando embeddings...")
+            file_embeddings = []
             for i, chunk in enumerate(chunks):
                 try:
                     embedding = self.embeddings.embed_query(chunk)
-                    chunk_id = f"{os.path.basename(file_path).replace('.txt', '')}_{i}"
-                    self.collection.add(
-                        ids=[chunk_id],
-                        embeddings=[embedding],
-                        documents=[chunk],
-                        metadatas=[{"source": os.path.basename(file_path), "chunk_id": i}]
-                    )
-                    time.sleep(0.1)
+                    file_embeddings.append({
+                        "chunk_id": i,
+                        "text": chunk,
+                        "embedding": embedding
+                    })
                 except Exception as e:
-                    print(f"Error procesando chunk {i} de {file_path}: {str(e)}")
+                    print(f"Error generando embedding para chunk {i} de {file_name}: {str(e)}")
                     continue
+            
+            # Guardar embeddings del archivo
+            embeddings_data[file_name] = file_embeddings
+            
+            # Almacenar en ChromaDB
+            print("Almacenando en ChromaDB...")
+            for embedding_data in file_embeddings:
+                try:
+                    self.collection.add(
+                        ids=[f"{file_name}_{embedding_data['chunk_id']}"],
+                        embeddings=[embedding_data['embedding']],
+                        documents=[embedding_data['text']],
+                        metadatas=[{"source": file_name, "chunk_id": embedding_data['chunk_id']}]
+                    )
+                except Exception as e:
+                    print(f"Error almacenando en ChromaDB: {str(e)}")
+                    continue
+            
+            # Guardar embeddings actualizados
+            self.save_embeddings(embeddings_data)
 
     def check_cache(self, question: str, similarity_threshold: float = 0.85) -> str:
         """Verifica si existe una respuesta similar en la caché."""
@@ -265,7 +327,6 @@ class WebRAGSystem:
                 self.add_to_context_cache(question, context)
             else:
                 print("No se encontró información en el contexto almacenado. Buscando en archivos de texto...")
-                # Obtener la lista de archivos de texto
                 file_paths = [os.path.join('data', 'processed', url) for url in self.get_available_files()]
                 relevant_files = self.filter_relevant_files(file_paths, question)
                 self.process_and_store_content(relevant_files)
@@ -286,20 +347,51 @@ class WebRAGSystem:
         print(context)
         
         print("Generando respuesta integrada...")
-        prompt = f"""¡Hola! Voy a ayudarte con tu pregunta sobre FicZone 2025.
-        Para darte la mejor respuesta, seguiré estas pautas:
-        • Responderé de forma clara y directa
-        • Usaré un tono amigable y cercano
-        • Si no tengo la información, te lo diré con sinceridad
-        • Organizaré la información en viñetas para que sea fácil de leer
-        • Me centraré en lo más importante
+        
+        # Verificar si la pregunta es sobre horarios
+        if any(word in question.lower() for word in ['horario', 'horarios', 'hora', 'cuándo', 'cuando', 'abre', 'cierra']):
+            prompt = f"""¡Hola! Voy a ayudarte con tu pregunta sobre los horarios de FicZone 2025.
+            Para darte la mejor respuesta, seguiré estas pautas:
+            
+            1. Resumen General:
+            • Especificar claramente las fechas del evento
+            • Horario de apertura y cierre para cada día
+            • Si hay diferentes horarios para diferentes zonas, especificarlo
+            
+            2. Detalles por Día:
+            • Organizar la información por día
+            • Para cada día, listar los eventos principales con sus horarios
+            • Incluir cualquier cambio de horario especial
+            
+            3. Formato:
+            • Usar viñetas para mejor legibilidad
+            • Separar claramente la información por días
+            • Destacar los horarios más importantes
+            
+            Con esta información:
+            {context}
 
-        Con esta información:
-        {context}
+            Tu pregunta es: {question}
 
-        Tu pregunta es: {question}
+            Por favor, responde en español de forma amigable, siguiendo exactamente esta estructura:
+            1. Primero el resumen general con fechas y horarios de apertura/cierre
+            2. Luego los detalles organizados por día
+            3. Finalmente cualquier información adicional relevante sobre horarios"""
+        else:
+            prompt = f"""¡Hola! Voy a ayudarte con tu pregunta sobre FicZone 2025.
+            Para darte la mejor respuesta, seguiré estas pautas:
+            • Responderé de forma clara y directa
+            • Usaré un tono amigable y cercano
+            • Si no tengo la información, te lo diré con sinceridad
+            • Organizaré la información en viñetas para que sea fácil de leer
+            • Me centraré en lo más importante
 
-        Por favor, responde en español de forma amigable:"""
+            Con esta información:
+            {context}
+
+            Tu pregunta es: {question}
+
+            Por favor, responde en español de forma amigable:"""
         
         response = self.final_model.invoke(prompt)
         
@@ -311,8 +403,12 @@ class WebRAGSystem:
     def get_available_files(self) -> List[str]:
         """Obtiene la lista de archivos disponibles en el directorio processed."""
         try:
-            with open(URLS_FILE, 'r', encoding='utf-8') as f:
-                return [line.strip() for line in f if line.strip()]
+            # Obtener todos los archivos .txt del directorio processed
+            files = []
+            for file in os.listdir(PROCESSED_DIR):
+                if file.endswith('.txt') and file != 'urls.txt':
+                    files.append(file)
+            return files
         except Exception as e:
             print(f"Error al leer archivos disponibles: {str(e)}")
             return []
@@ -364,9 +460,8 @@ def main():
     # Inicializar el sistema
     rag = WebRAGSystem()
     
-    # Leer URLs del archivo
-    with open('data/processed/urls.txt', 'r', encoding='utf-8') as f:
-        urls = [line.strip() for line in f if line.strip()]
+    # Obtener lista de archivos disponibles
+    urls = rag.get_available_files()
     
     print(f"\nArchivos disponibles: {len(urls)}")
     for url in urls:
